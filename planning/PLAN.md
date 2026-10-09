@@ -147,7 +147,7 @@ DB_PATH=
 - If `MASSIVE_API_KEY` is absent or empty → backend uses the built-in market simulator
 - If `LLM_MOCK=true` → backend returns deterministic mock LLM responses (see Section 9)
 - If `OPENROUTER_API_KEY` is missing and `LLM_MOCK` is not `true` → the app starts normally; `POST /api/chat` returns `503` with `{"detail": "AI chat is not configured. Set OPENROUTER_API_KEY in .env (or LLM_MOCK=true)."}` and the chat panel shows that message. No silent fallback to mock.
-- **The backend reads configuration from environment variables only.** In Docker they are supplied via `env_file: .env` in `docker-compose.yml`. For local development, the backend calls `python-dotenv`'s `load_dotenv()` on the project-root `.env` at startup; this is a no-op in the container where no `.env` file exists.
+- **The backend reads configuration from environment variables only.** In Docker they are supplied via an optional `env_file` (`.env`, `required: false`) plus an explicit `LLM_MOCK` passthrough in `docker-compose.yml` (§12). For local development, the backend calls `python-dotenv`'s `load_dotenv()` on the project-root `.env` at startup; this is a no-op in the container where no `.env` file exists.
 
 ---
 
@@ -288,14 +288,27 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 
 These rules apply identically to manual trades (`POST /api/portfolio/trade`) and LLM trades.
 
-- **Ticker**: normalized and validated per Section 6. Trading a ticker that is not on the watchlist is allowed; it is **automatically added to the watchlist** first (so it starts being tracked and appears in the UI).
+- **Ticker**: normalized and validated per Section 6. **Buying** a ticker that is not on the watchlist is allowed; it is **automatically added to the watchlist** first (so it starts being tracked and appears in the UI). Sells never touch the watchlist: a sell requires a held position, and held tickers are already tracked (§6), so fully selling an off-watchlist position untracks it rather than re-adding it.
 - **Quantity**: must be a finite number `> 0`. No minimum lot size. Fractional shares allowed.
-- **Price**: the current cache price. If there is no price yet (`None`), the trade is rejected with `409` `{"detail": "No price available for XYZ yet. Try again shortly."}` and nothing is written.
+- **Price**: the current cache price, **read once** and used both for validation and as the recorded trade price. If there is no price yet (`None`), the trade is rejected with `409` `{"detail": "No price available for XYZ yet. Try again shortly."}` and no trade, position, cash, or snapshot rows are written.
 - **Buy**: requires `quantity × price ≤ cash` (with a `1e-9` tolerance), else `400` `"Insufficient cash"`. Updates `avg_cost` as a weighted average: `(old_qty × old_avg + qty × price) / (old_qty + qty)`.
 - **Sell**: requires `quantity ≤ held quantity` (with a `1e-9` tolerance), else `400` `"Insufficient shares"`. `avg_cost` is unchanged. If the remaining quantity is `< 1e-9`, the position row is deleted. Selling a ticker you don't hold is `400`.
 - **Realized P&L** is not tracked (out of scope). Unrealized P&L = `(current_price − avg_cost) × quantity`.
 - **Rounding**: store full-precision floats; round only for display (prices and money to 2 dp, quantities to up to 4 dp).
 - A successful trade inserts a `trades` row and records a portfolio snapshot.
+
+### Trade Execution Order
+
+Every trade (manual or LLM) runs these steps in order. The async `source.add_ticker` call can't happen inside the SQLite transaction, so the watchlist auto-add is a separate step that comes before it:
+
+1. **Validate input**: normalize the ticker, check quantity and side. On failure, return `400` and write nothing.
+2. **Auto-add (buys only)**: if the ticker is not on the watchlist, insert the watchlist row and `await source.add_ticker(ticker)`. **This persists even if the trade later fails** (409, insufficient cash, etc.); the user simply ends up watching the ticker. In simulator mode a price is available immediately. In Massive mode the trade typically returns `409` until the next poll.
+3. **Read the price** once from the cache. If it is `None`, return `409`.
+4. **Transaction**: `BEGIN IMMEDIATE` → read cash and position → validate (insufficient cash or shares → rollback, `400`) → upsert/delete the position → insert the trade → update cash → commit.
+5. **Snapshot**: record a portfolio snapshot.
+6. **Untrack**: if the position was closed and the ticker is not on the watchlist, `await source.remove_ticker(ticker)`.
+
+In chat, each action runs this sequence independently, so a failed watchlist change has no effect on a following trade. A buy still auto-adds its own ticker.
 
 ---
 
@@ -391,7 +404,7 @@ When the user sends a chat message, the backend:
 1. Loads the user's current portfolio context (cash, positions with P&L, watchlist with live prices, total portfolio value)
 2. Loads the **last 20** messages from `chat_messages`. For assistant messages with actions, a compact summary of the action results is appended to the content (e.g. `[Actions: buy 10 AAPL @ 190.10 executed; sell 5 TSLA failed: Insufficient shares]`) so the LLM sees the outcome of its previous actions.
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
-4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
+4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill. The call **must be async**: `await litellm.acompletion(..., timeout=30)`. The skill's examples use synchronous `litellm.completion`, which would block the event loop and freeze SSE, the simulator, and all other requests for the whole call. A timeout or any other LLM exception maps to `502`.
 5. Parses the complete structured JSON response
 6. Executes watchlist changes, then trades, **sequentially and independently**: each one is validated and applied on its own (Section 8). A failure doesn't stop the others; each item gets its own `status` and `error`.
 7. Stores the user message and the assistant message (with action results in `actions`) in `chat_messages`
@@ -492,7 +505,7 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 ### Data Flow
 
 - On load: `GET /api/portfolio`, `GET /api/watchlist`, `GET /api/portfolio/history`, `GET /api/chat/history`, and open the SSE stream.
-- After a trade or chat response: replace portfolio state with the `portfolio` object returned in the response (no follow-up GET). After a chat response with watchlist changes, re-fetch `GET /api/watchlist`.
+- After a trade or chat response: replace portfolio state with the `portfolio` object returned in the response (no follow-up GET). After **every successful trade and every chat response**, re-fetch `GET /api/watchlist`, because buys can auto-add tickers (§8) even when the chat response has no `watchlist_changes`.
 - **Live total value** is computed on the frontend: `cash + Σ(quantity × latest SSE price)` (falling back to the server's `current_price`/`avg_cost` when no SSE price is known). No backend push is needed.
 - **Price history buffer**: the frontend keeps up to **500** points per ticker from the SSE stream (ring buffer, dropping the oldest). The main chart uses the whole buffer; sparklines use the last 100 points.
 
@@ -536,11 +549,18 @@ services:
     image: finally
     container_name: finally
     ports: ["8000:8000"]
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false   # app must start without .env (§5); needs Compose ≥ 2.24
+    environment:
+      - LLM_MOCK=${LLM_MOCK:-false}   # lets `LLM_MOCK=true docker compose up` work for E2E
     volumes: ["finally-data:/app/db"]
 volumes:
   finally-data:
 ```
+
+- `.env` is optional. Without it the app starts with the simulator, and chat returns `503` (§5).
+- `LLM_MOCK` is passed through explicitly because `env_file` only reads the file and never sees shell variables. Compose interpolation reads both the shell and `.env`, so setting `LLM_MOCK=true` in either place works. `environment` takes precedence over `env_file`.
 
 - Start: `docker compose up -d` (add `--build` to rebuild). Works on macOS, Linux, and Windows.
 - Stop: `docker compose down` — the named volume `finally-data` (and the database) persists. `docker compose down -v` resets all data.
@@ -581,7 +601,15 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 
 ### E2E Tests (in `test/`)
 
-**Infrastructure**: Playwright runs **on the host** (`npx playwright install` locally or in CI) against the app started with `docker compose up -d` and `LLM_MOCK=true`. No separate Playwright container.
+**Infrastructure**: Playwright runs **on the host** (`npx playwright install` locally or in CI) against the app started fresh in mock mode:
+
+```bash
+docker compose down -v                      # empty volume → seeded DB, $10k cash
+LLM_MOCK=true docker compose up -d --build
+npx playwright test
+```
+
+No separate Playwright container. The `down -v` matters because "Fresh start" scenarios assume a newly seeded database.
 
 **Key Scenarios**:
 
